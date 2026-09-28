@@ -151,3 +151,67 @@ python -m mast3r.covisibility \
     --image_size 518 \
     --subsample 2
 ```
+
+## 7. 时间窗口模式 (`covisibility_window.py`)
+
+新增 `mast3r/covisibility_window.py`，支持按时间窗口分组计算共视图。
+
+给定 `--window_size S`（例如 `-S 4`），将帧序列按 `S` 帧一组划窗：
+- Window 0: 帧 0~3
+- Window 1: 帧 4~7
+- ...
+
+每个窗口**内部**独立计算共视图：只在该窗口的其他帧之间做稠密匹配，输出该窗口内每个像素被"同窗口内几个其他帧同时看到"的计数图。
+
+### 用法示例
+
+```bash
+cd /home/djhuai/zuo/cvpr/mast3r
+source /home/djhuai/anaconda3/bin/activate mast3r
+
+# 每 4 帧一个窗口计算共视图
+python -m mast3r.covisibility_window \
+    --weights checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth \
+    --images assets/003_120 \
+    --output out/covis_window \
+    --window_size 4 \
+    --overlay \
+    --subsample 2
+```
+
+### 输出结构
+
+```
+out/covis_window/
+├── covisibility_stats.json          # 全局统计（窗口数、帧数等）
+├── window_000/                      # 第一个窗口（帧 0~3）
+│   ├── covisibility_map_000.png     # 帧 0 的灰度共视图
+│   ├── covisibility_map_001.png     # 帧 1 的灰度共视图
+│   ├── covisibility_map_002.png     # 帧 2 的灰度共视图
+│   ├── covisibility_map_003.png     # 帧 3 的灰度共视图
+│   ├── covisibility_stats.json      # 该窗口统计
+│   └── ...                          # overlay / visibility (若启用)
+├── window_001/                      # 第二个窗口（帧 4~7）
+│   └── ...
+```
+
+每个 `covisibility_map_XXX.png` 是**灰度图**：像素越亮（越白）= 该像素在窗口内被越多次重复看到；纯黑 = 无共视对应。
+
+### 新增参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--window_size` / `-S` | 无（不分组） | 时间窗口大小。例：`-S 4` 每 4 帧一组。不设则退化为原版全局计算 |
+
+其余参数与原版 `covisibility.py` 完全一致。
+
+
+--camera 0 就是你要的前视图筛选，两个脚本都已经内置了。用法：
+
+python -m mast3r.covisibility_window \
+    --weights checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth \
+    --images /path/to/nuscenes/images \
+    --output out/covis_window \
+    --camera 0 \
+    --window_size 4 \
+    --subsample 1
