@@ -1,0 +1,29 @@
+[
+  {
+    "scene": "003",
+    "n_static": 608757,
+    "n_redundant": 515220,
+    "redundant_ratio_pct": 84.6,
+    "repeat_thresh": 0.5,
+    "contrib_thresh": 0.2,
+    "n_frames": 4,
+    "visible_count_distribution": {
+      "0": 221,
+      "1": 65731,
+      "2": 90519,
+      "3": 100428,
+      "4": 351858
+    },
+    "repeat_score_mean": 0.8031,
+    "contribution_norm_mean": 0.0401,
+    "redundancy_score_mean": 0.7723,
+    "redundancy_score_max": 1.0,
+    "baseline_psnr": 27.3181,
+    "baseline_ssim": 0.8887,
+    "baseline_lpips": 0.1189,
+    "masked_psnr": 8.8773,
+    "masked_ssim": 0.4053,
+    "masked_lpips": 0.6156,
+    "delta_psnr": -18.4408
+  }
+]
