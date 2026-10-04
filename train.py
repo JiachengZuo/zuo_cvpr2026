@@ -26,15 +26,20 @@ import time
 def compute_lifespan_loss(gamma):
     return torch.mean(torch.abs(1 / (gamma + 1e-6)))
 
-def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1):
-    sigma = torch.log(torch.tensor(gamma1)).to(gamma0.device) /  ((gamma0)**2 + 1e-6)
-    conf = torch.exp(sigma*(t0-t)**2)
+def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1, K = 4):
+    sigma = torch.log(torch.tensor(gamma1)).to(gamma0.device) / ((gamma0)**2 + 1e-6)
+    if gamma0.dim() == 2:
+        # Unfiltered: gamma0 [N, K] -> expand to [N*K]
+        conf = torch.exp(sigma.flatten()*torch.concatenate([(t0-t)]*K)**2)
+    else:
+        # [MODIFIED] Post-filter: gamma0 [M], alpha [M], t [M] all 1D aligned
+        conf = torch.exp(sigma * (t0 - t)**2)
     alpha_ = alpha * conf
     return alpha_.float()
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--image_dir', type=str, default="")
+    parser.add_argument('--image_dir', type=str, default="/home/djhuai/zuo/mobicom/dggt_2/dggt/data/nuscenes/processed_10Hz/mini")
     parser.add_argument('--ckpt_path', type=str, default='')
     parser.add_argument('--log_dir', type=str, default='logs/xxx')
     parser.add_argument('--sequence_length', type=int, default=4)#8,4
@@ -50,16 +55,17 @@ def parse_args():
     return parser.parse_args()
 
 def main(args):
+    
     dist.init_process_group(backend='nccl')
     args.local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     dtype = torch.float32
     
-    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(300,600)], sequence_length=args.sequence_length, mode=1, views=1)
+    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(0,10)], sequence_length=args.sequence_length, mode=1, views=1)
     sampler = DistributedSampler(dataset,shuffle=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
-
+    
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         os.makedirs(os.path.join(args.log_dir, "images"), exist_ok=True)
@@ -101,7 +107,7 @@ def main(args):
     )
 
     for step in tqdm(range(args.max_epoch)):
-        sampler.set_epoch(step)        
+        sampler.set_epoch(step)       
         for batch in dataloader:
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
@@ -126,39 +132,112 @@ def main(args):
                 if use_depth:
                     depth_map = predictions["depth"][0]
                     point_map = unproject_depth_map_to_point_map(depth_map, extrinsics[0], intrinsics[0])[None,...]
+                    # torch.Size([1, 4, 294, 518, 4, 3])
                     point_map = torch.from_numpy(point_map).to(device).float()
                 else:      
                     point_map = predictions["world_points"]
+                
+                # torch.Size([1, 4, 294, 518, 4, 11])
                 gs_map = predictions["gs_map"]
+                # torch.Size([1, 4, 294, 518, 4])
                 gs_conf = predictions["gs_conf"]
+                # torch.Size([1, 4, 294, 518])
                 dy_map = predictions["dynamic_conf"].squeeze(-1) #B,H,W,1
                 semantic_logits = predictions["semantic_logits"]  #road, building, car, truck, person, bicycle, sky, vegetation
                 K_gs = get_k_from_gs_map(gs_map)
 
+                # torch.Size([1, 4, 294, 518])
                 static_mask = torch.ones_like(bg_mask)
+                # torch.Size([2436672, 3])
                 static_points = point_map[static_mask].reshape(-1, 3)
                 gs_dynamic_list = dy_map[static_mask].sigmoid()
                 static_rgbs, static_opacity, static_scales, static_rotations = get_split_gs(gs_map, static_mask)
-                static_gs_conf = get_gs_conf_flat(gs_conf, static_mask)
                 frame_idx = torch.nonzero(static_mask, as_tuple=False)[:,1]
-                if K_gs > 1:
-                    static_points = static_points.repeat_interleave(K_gs, dim=0)
-                    gs_dynamic_list = gs_dynamic_list.repeat_interleave(K_gs, dim=0)
-                    frame_idx = frame_idx.repeat_interleave(K_gs, dim=0)
+
+                # ============================================================
+                # [MODIFIED] Per-pixel K-Gaussian selection via co-visibility.
+                # Physically remove inactive Gaussians to save memory/compute.
+                # ============================================================
+                cov_score = predictions.get('covisibility_score')
+                if cov_score is not None and K_gs > 1:
+                    static_gs_conf_raw = gs_conf[static_mask]  # [N, K]
+                    cov_score_static = cov_score[static_mask]  # [N]
+
+                    active_count = torch.where(
+                        cov_score_static > 0.75, 1,
+                        torch.where(cov_score_static > 0.25, 2, K_gs)
+                    ).long().clamp(1, K_gs)
+
+                    N_pix = static_gs_conf_raw.shape[0]
+                    _, sorted_idx = static_gs_conf_raw.sort(dim=1, descending=True)
+                    active_k_mask = torch.zeros(N_pix, K_gs, dtype=torch.bool, device=device)
+                    n_range = torch.arange(N_pix, device=device)
+                    for k in range(K_gs):
+                        active_k_mask[n_range, sorted_idx[:, k]] = (k < active_count)
+                    active_mask = active_k_mask.reshape(-1)
+
+                    # Physically remove inactive Gaussians
+                    static_points = static_points[active_mask]
+                    static_rgbs = static_rgbs[active_mask]
+                    static_opacity = static_opacity[active_mask]
+                    static_scales = static_scales[active_mask]
+                    static_rotations = static_rotations[active_mask]
+                    static_gs_conf = static_gs_conf_raw[active_k_mask]  # [M]
+                    gs_timestamps = timestamps[frame_idx].repeat_interleave(K_gs)[active_mask]
+                    gs_dynamic_list = gs_dynamic_list.repeat_interleave(K_gs)[active_mask]
+                else:
+                    static_gs_conf = get_gs_conf_flat(gs_conf, static_mask)
+                    if K_gs > 1:
+                        static_points = static_points.repeat_interleave(K_gs, dim=0)
+                        gs_dynamic_list = gs_dynamic_list.repeat_interleave(K_gs, dim=0)
+                        frame_idx = frame_idx.repeat_interleave(K_gs, dim=0)
+                    gs_timestamps = timestamps[frame_idx]
+
                 static_opacity = static_opacity * (1 - gs_dynamic_list)
-                gs_timestamps = timestamps[frame_idx]
 
                 dynamic_points, dynamic_rgbs, dynamic_opacitys, dynamic_scales, dynamic_rotations = [], [], [], [], []
                 for i in range(dy_map.shape[1]):
-                    point_map_i = point_map[:, i]
+                    point_map_i = point_map[:, i]  # [1, H, W, K, 3]
                     bg_mask_i = bg_mask[:, i]
-                    dynamic_point = point_map_i[bg_mask_i].reshape(-1, 3)
-                    dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, i], bg_mask_i)
-                    gs_dynamic_list_i = dy_map[:, i][bg_mask_i].sigmoid()
-                    if K_gs > 1:
-                        dynamic_point = dynamic_point.repeat_interleave(K_gs, dim=0)
-                        gs_dynamic_list_i = gs_dynamic_list_i.repeat_interleave(K_gs, dim=0)
-                    dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
+                    dynamic_point = point_map_i[bg_mask_i].reshape(-1, 3)  # [N*K, 3]
+                    dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, i], bg_mask_i)  # [N*K, C]
+                    gs_dynamic_list_i = dy_map[:, i][bg_mask_i].sigmoid()  # [N]
+
+                    # ============================================================
+                    # [MODIFIED] Per-pixel K-Gaussian selection via co-visibility.
+                    # Physically remove inactive Gaussians for dynamic objects.
+                    # ============================================================
+                    cov_score = predictions.get('covisibility_score')
+                    if cov_score is not None and K_gs > 1:
+                        gs_conf_i = gs_conf[:, i][bg_mask_i]  # [N, K]
+                        cov_score_i = cov_score[:, i][bg_mask_i]  # [N]
+
+                        active_count = torch.where(
+                            cov_score_i > 0.75, 1,
+                            torch.where(cov_score_i > 0.25, 2, K_gs)
+                        ).long().clamp(1, K_gs)
+
+                        N_pix = gs_conf_i.shape[0]
+                        _, sorted_idx = gs_conf_i.sort(dim=1, descending=True)
+                        active_k_mask = torch.zeros(N_pix, K_gs, dtype=torch.bool, device=device)
+                        n_range = torch.arange(N_pix, device=device)
+                        for k in range(K_gs):
+                            active_k_mask[n_range, sorted_idx[:, k]] = (k < active_count)
+                        active_mask = active_k_mask.reshape(-1)  # [N*K]
+
+                        # Physically remove inactive Gaussians
+                        dynamic_point = dynamic_point[active_mask]
+                        dynamic_rgb = dynamic_rgb[active_mask]
+                        dynamic_opacity = dynamic_opacity[active_mask]
+                        dynamic_scale = dynamic_scale[active_mask]
+                        dynamic_rotation = dynamic_rotation[active_mask]
+                        gs_dynamic_list_i = gs_dynamic_list_i.repeat_interleave(K_gs)[active_mask]
+
+                        dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
+                    else:
+                        gs_dynamic_list_i = torch.concatenate([gs_dynamic_list_i] * K_gs)
+                        dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
+
                     dynamic_points.append(dynamic_point)
                     dynamic_rgbs.append(dynamic_rgb)
                     dynamic_opacitys.append(dynamic_opacity)
@@ -169,13 +248,23 @@ def main(args):
                 S = extrinsic.shape[0]
                 for idx in range(S):
                     t0 = timestamps[idx]
+                    # torch.Size([1218336])
                     static_opacity_ = alpha_t(gs_timestamps, t0, static_opacity, gamma0 = static_gs_conf)
+                    # torch.Size([1218336, 3]) torch.Size([1218336, 3]) torch.Size([1218336]) torch.Size([1218336, 3]) torch.Size([1218336, 4])
                     static_gs_list = [static_points, static_rgbs, static_opacity_, static_scales, static_rotations]
                     if dynamic_points:
                         world_points, rgbs, opacity, scales, rotation = concat_list(
                             static_gs_list,
                             [dynamic_points[idx], dynamic_rgbs[idx], dynamic_opacitys[idx], dynamic_scales[idx], dynamic_rotations[idx]]#注释
                         )
+                    
+                    # torch.Size([3502352, 3])
+                    # torch.Size([1789340, 4])
+                    # torch.Size([1789340, 3])
+                    # torch.Size([1789340])
+                    # torch.Size([1, 4, 4])
+                    # torch.Size([1, 3, 3])
+                    import pdb; pdb.set_trace()
                     renders_chunk, alphas_chunk, _ = rasterization(
                         means=world_points, 
                         quats=rotation, 
@@ -187,6 +276,7 @@ def main(args):
                         width=W, 
                         height=H, 
                     )
+                    
                     chunked_renders.append(renders_chunk)
                     chunked_alphas.append(alphas_chunk)
 

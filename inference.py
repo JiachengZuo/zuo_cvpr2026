@@ -178,7 +178,7 @@ def main():
                         point_map_chunk = unproject_depth_map_to_point_map(depth_map[:, :, :, i, :], extrinsics[0], intrinsics[0])[None,...]
                         point_map.append(point_map_chunk)
                     
-                    point_map = np.stack(point_map, axis=-2)  # torch.Size([1, 4, 294, 518, 3, 4])
+                    point_map = np.stack(point_map, axis=-2)  # [1, S, H, W, K, 3]
                     point_map = torch.from_numpy(point_map).to(device).float()
                 else:
                     # torch.Size([1, 4, 294, 518, 4, 3])
@@ -270,21 +270,48 @@ def main():
 
 
                 dynamic_points, dynamic_rgbs, dynamic_opacitys, dynamic_scales, dynamic_rotations = [], [], [], [], []
-                # torch.Size([1, 4, 294, 518])
                 for i in range(dy_map.shape[1]):
-                    # torch.Size([1, 294, 518, 4, 3])
-                    point_map_i = point_map[:, i]
-                    # torch.Size([1, 294, 518])
+                    point_map_i = point_map[:, i]  # [1, H, W, K, 3]
                     bg_mask_i = bg_mask[:, i]
-                    dy_conf_i = dy_map[:, i].sigmoid()
 
-                    # torch.Size([503968, 3])
-                    dynamic_point = point_map_i[bg_mask_i].reshape(-1, 3)
-                    # torch.Size([503968, 3]) torch.Size([503968]) torch.Size([503968, 3]) torch.Size([503968, 3])
-                    dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, i], bg_mask_i)
-                    # torch.Size([125992]) [1, 294, 518]
-                    gs_dynamic_list_i = dy_map[:, i][bg_mask_i].sigmoid()
-                    dynamic_opacity = dynamic_opacity * torch.concatenate([gs_dynamic_list_i] * K)
+                    dynamic_point = point_map_i[bg_mask_i].reshape(-1, 3)  # [N*K, 3]
+                    dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, i], bg_mask_i)  # [N*K, C]
+                    gs_dynamic_list_i = dy_map[:, i][bg_mask_i].sigmoid()  # [N]
+
+                    # ============================================================
+                    # [MODIFIED] Per-pixel K-Gaussian selection via co-visibility.
+                    # Physically remove inactive Gaussians for dynamic objects.
+                    # ============================================================
+                    cov_score = predictions.get('covisibility_score')
+                    if cov_score is not None and K > 1:
+                        gs_conf_i = gs_conf[:, i][bg_mask_i]  # [N, K]
+                        cov_score_i = cov_score[:, i][bg_mask_i]  # [N]
+
+                        active_count = torch.where(
+                            cov_score_i > 0.75, 1,
+                            torch.where(cov_score_i > 0.25, 2, K)
+                        ).long().clamp(1, K)
+
+                        N_pix = gs_conf_i.shape[0]
+                        _, sorted_idx = gs_conf_i.sort(dim=1, descending=True)
+                        active_k_mask = torch.zeros(N_pix, K, dtype=torch.bool, device=device)
+                        n_range = torch.arange(N_pix, device=device)
+                        for k in range(K):
+                            active_k_mask[n_range, sorted_idx[:, k]] = (k < active_count)
+                        active_mask = active_k_mask.reshape(-1)  # [N*K]
+
+                        # Physically remove inactive Gaussians
+                        dynamic_point = dynamic_point[active_mask]
+                        dynamic_rgb = dynamic_rgb[active_mask]
+                        dynamic_opacity = dynamic_opacity[active_mask]
+                        dynamic_scale = dynamic_scale[active_mask]
+                        dynamic_rotation = dynamic_rotation[active_mask]
+                        gs_dynamic_list_i = gs_dynamic_list_i.repeat_interleave(K)[active_mask]
+
+                        dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
+                    else:
+                        gs_dynamic_list_i = torch.concatenate([gs_dynamic_list_i] * K)
+                        dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
 
                     dynamic_points.append(dynamic_point)
                     dynamic_rgbs.append(dynamic_rgb)
@@ -335,6 +362,7 @@ def main():
                             )
                         else:
                             world_points, rgbs, opacity, scales, rotation = static_gs_list
+                        # torch.Size([1651836, 3])
                         renders_chunk, alphas_chunk, _ = rasterization(
                             means=world_points,
                             quats=rotation,
