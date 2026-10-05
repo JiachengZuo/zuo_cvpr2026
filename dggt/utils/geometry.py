@@ -24,9 +24,8 @@ def unproject_depth_map_to_point_map(
     Returns:
         np.ndarray: Batch of 3D world coordinates of shape (S, H, W, 3)
     """
-    
     if isinstance(depth_map, torch.Tensor):
-        depth_map = depth_map.cpu().numpy()
+        depth_map = depth_map.detach().cpu().numpy()
     if isinstance(extrinsics_cam, torch.Tensor):
         extrinsics_cam = extrinsics_cam.cpu().numpy()
     if isinstance(intrinsics_cam, torch.Tensor):
@@ -100,10 +99,14 @@ def depth_to_cam_coords_points(depth_map: np.ndarray, intrinsic: np.ndarray) -> 
     Returns:
         tuple[np.ndarray, np.ndarray]: Camera coordinates (H, W, 3)
     """
-    H, W = depth_map.shape
-    assert intrinsic.shape == (3, 3), "Intrinsic matrix must be 3x3"
-    assert intrinsic[0, 1] == 0 and intrinsic[1, 0] == 0, "Intrinsic matrix must have zero skew"
-
+    if depth_map.shape[-1] == 4:
+        H, W = depth_map.shape[:2]
+        assert intrinsic.shape == (3, 3), "Intrinsic matrix must be 3x3"
+        assert intrinsic[0, 1] == 0 and intrinsic[1, 0] == 0, "Intrinsic matrix must have zero skew"
+    else: 
+        H, W = depth_map.shape
+        assert intrinsic.shape == (3, 3), "Intrinsic matrix must be 3x3"
+        assert intrinsic[0, 1] == 0 and intrinsic[1, 0] == 0, "Intrinsic matrix must have zero skew"
     # Intrinsic parameters
     fu, fv = intrinsic[0, 0], intrinsic[1, 1]
     cu, cv = intrinsic[0, 2], intrinsic[1, 2]
@@ -111,13 +114,26 @@ def depth_to_cam_coords_points(depth_map: np.ndarray, intrinsic: np.ndarray) -> 
     # Generate grid of pixel coordinates
     u, v = np.meshgrid(np.arange(W), np.arange(H))
 
-    # Unproject to camera coordinates
-    x_cam = (u - cu) * depth_map / fu
-    y_cam = (v - cv) * depth_map / fv
-    z_cam = depth_map
+    if depth_map.shape[-1] == 4:
+        H, W, C = depth_map.shape
+        points_list = []
+        for c in range(C):
+            depth_c = depth_map[..., c] # (H,W)，单通道深度
+            x_cam = (u - cu) * depth_c / fu
+            y_cam = (v - cv) * depth_c / fv
+            z_cam = depth_c
+            pts = np.stack([x_cam, y_cam, z_cam], axis=-1) # (H,W,3)
+            points_list.append(pts)
 
-    # Stack to form camera coordinates
-    cam_coords = np.stack((x_cam, y_cam, z_cam), axis=-1).astype(np.float32)
+        # 合并成 (H,W,4,3)
+        cam_coords = np.stack(points_list, axis=-2)
+    else:
+        # Stack to form camera coordinates
+        # Unproject to camera coordinates
+        x_cam = (u - cu) * depth_map / fu
+        y_cam = (v - cv) * depth_map / fv
+        z_cam = depth_map
+        cam_coords = np.stack((x_cam, y_cam, z_cam), axis=-1).astype(np.float32)
 
     return cam_coords
 

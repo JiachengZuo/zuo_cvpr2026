@@ -82,7 +82,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["covisibility_score"] = cov_score
             predictions["covisibility_conf"] = cov_conf
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration

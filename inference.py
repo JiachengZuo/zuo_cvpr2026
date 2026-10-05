@@ -268,7 +268,6 @@ def main():
                     gs_timestamps = timestamps[frame_idx]
                     static_opacity = static_opacity * (1 - gs_dynamic_list)
 
-
                 dynamic_points, dynamic_rgbs, dynamic_opacitys, dynamic_scales, dynamic_rotations = [], [], [], [], []
                 for i in range(dy_map.shape[1]):
                     point_map_i = point_map[:, i]  # [1, H, W, K, 3]
@@ -319,7 +318,11 @@ def main():
                     dynamic_scales.append(dynamic_scale)
                     dynamic_rotations.append(dynamic_rotation)
 
-                
+
+                # Sync after ALL K-filtering (static + dynamic) before rendering
+                if K > 1:
+                    torch.cuda.synchronize()
+
                 chunked_renders, chunked_alphas = [], []
                 if args.mode == 3:
                     origin_extrinsic = extrinsic
