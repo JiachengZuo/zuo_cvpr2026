@@ -26,6 +26,64 @@ import time
 def compute_lifespan_loss(gamma):
     return torch.mean(torch.abs(1 / (gamma + 1e-6)))
 
+
+def compute_gs_conf_slot_loss(gs_conf_raw, cov_score, K):
+    """
+    K-slot gs_conf alignment loss using soft co-visibility targets.
+
+    Uses cov_score (continuous [0,1]) directly to create per-slot
+    soft targets via linear decay, instead of hard binary thresholds.
+
+    cov ≈ 1.0 → only slot 0 active (target [1, 0, 0, 0])
+    cov ≈ 0.5 → slots 0-1 moderately active (target [1, 0.6, 0.2, 0])
+    cov ≈ 0.0 → all K slots near 1 (target [1, 0.75, 0.5, 0.25])
+
+    Args:
+        gs_conf_raw: [N, K] raw (pre-filter) gs_conf values
+        cov_score: [N] co-visibility score per pixel
+        K: number of Gaussian slots
+
+    Returns:
+        scalar loss
+    """
+    device = gs_conf_raw.device
+    N = gs_conf_raw.shape[0]
+
+    # desired_slots: cov=1→1, cov=0→K
+    desired_slots = 1.0 + (1.0 - cov_score) * (K - 1)  # [N], range [1, K]
+
+    k_idx = torch.arange(K, device=device).float().unsqueeze(0)  # [1, K]
+
+    # Soft target: slot k target = max(0, 1 - k/desired)
+    # Linear decay — slots beyond desired_slots go to 0
+    raw_target = 1.0 - k_idx / desired_slots.unsqueeze(1)  # [N, K]
+    soft_target = raw_target.clamp(0.0, 1.0)  # [N, K]
+
+    return F.binary_cross_entropy_with_logits(gs_conf_raw, soft_target)
+
+
+def compute_covis_weighted_l1(rendered, target, cov_score):
+    """
+    Co-visibility weighted L1 rendering loss.
+
+    Low co-visibility pixels get higher weight (2×) because they
+    appear in fewer frames and need more Gaussian capacity.
+
+    Args:
+        rendered: [S, 3, H, W] rendered images
+        target:  [S, 3, H, W] target images
+        cov_score: [S, H, W] co-visibility score
+
+    Returns:
+        weighted L1 loss
+    """
+    # Weight: cov=1 → w=1.0, cov=0 → w=3.0
+    weight = 1.0 + 2.0 * (1.0 - cov_score)  # [S, H, W]
+    weight = weight.unsqueeze(1)  # [S, 1, H, W]
+
+    pixel_loss = F.l1_loss(rendered, target, reduction='none')
+    return (pixel_loss * weight).mean()
+
 def alpha_t(t, t0, alpha, gamma0 = 1, gamma1 = 0.1, K = 4):
     sigma = torch.log(torch.tensor(gamma1)).to(gamma0.device) / ((gamma0)**2 + 1e-6)
     if gamma0.dim() == 2:
@@ -158,9 +216,12 @@ def main(args):
                 # [MODIFIED] Per-pixel K-Gaussian selection via co-visibility.
                 # Physically remove inactive Gaussians to save memory/compute.
                 # ============================================================
+                # Save raw gs_conf BEFORE filtering for slot loss
+                static_gs_conf_raw_all = gs_conf[static_mask]  # [N] or [N, K]
+
                 cov_score = predictions.get('covisibility_score')
                 if cov_score is not None and K_gs > 1:
-                    static_gs_conf_raw = gs_conf[static_mask]  # [N, K]
+                    static_gs_conf_raw = static_gs_conf_raw_all  # alias
                     cov_score_static = cov_score[static_mask]  # [N]
 
                     active_count = torch.where(
@@ -177,6 +238,7 @@ def main(args):
                     active_mask = active_k_mask.reshape(-1)
 
                     # Physically remove inactive Gaussians
+                    # static_points already [N*K, 3] from point_map K dim
                     static_points = static_points[active_mask]
                     static_rgbs = static_rgbs[active_mask]
                     static_opacity = static_opacity[active_mask]
@@ -188,7 +250,7 @@ def main(args):
                 else:
                     static_gs_conf = get_gs_conf_flat(gs_conf, static_mask)
                     if K_gs > 1:
-                        static_points = static_points.repeat_interleave(K_gs, dim=0)
+                        # static_points already [N*K, 3] from point_map K dim
                         gs_dynamic_list = gs_dynamic_list.repeat_interleave(K_gs, dim=0)
                         frame_idx = frame_idx.repeat_interleave(K_gs, dim=0)
                     gs_timestamps = timestamps[frame_idx]
@@ -207,7 +269,6 @@ def main(args):
                     # [MODIFIED] Per-pixel K-Gaussian selection via co-visibility.
                     # Physically remove inactive Gaussians for dynamic objects.
                     # ============================================================
-                    cov_score = predictions.get('covisibility_score')
                     if cov_score is not None and K_gs > 1:
                         gs_conf_i = gs_conf[:, i][bg_mask_i]  # [N, K]
                         cov_score_i = cov_score[:, i][bg_mask_i]  # [N]
@@ -264,7 +325,6 @@ def main(args):
                     # torch.Size([1789340])
                     # torch.Size([1, 4, 4])
                     # torch.Size([1, 3, 3])
-                    import pdb; pdb.set_trace()
                     renders_chunk, alphas_chunk, _ = rasterization(
                         means=world_points, 
                         quats=rotation, 
@@ -292,14 +352,29 @@ def main(args):
 
                 ####################### Loss ###########################
 
-
-                loss = F.l1_loss(rendered_image, target_image)
+                # ---- Co-visibility weighted render L1 ----
+                if cov_score is not None:
+                    render_loss = compute_covis_weighted_l1(
+                        rendered_image, target_image, cov_score[0]
+                    )
+                else:
+                    render_loss = F.l1_loss(rendered_image, target_image)
+                loss = render_loss
 
                 sky_mask_loss = F.l1_loss(alphas, 1 - sky_mask[0, ..., 0][..., None])
-                loss +=  sky_mask_loss
+                loss += sky_mask_loss
 
+                # ---- Lifespan regularization ----
                 gs_conf_loss = compute_lifespan_loss(static_gs_conf)
                 loss += 0.01 * gs_conf_loss
+
+                # ---- K-slot gs_conf alignment ----
+                if cov_score is not None and K_gs > 1:
+                    cov_score_static = cov_score[static_mask]  # [N]
+                    slot_loss = compute_gs_conf_slot_loss(
+                        static_gs_conf_raw_all, cov_score_static, K_gs
+                    )
+                    loss += 0.01 * slot_loss
                 
                 #dynamic mask loss
                 if 'dynamic_mask' in batch:
@@ -311,14 +386,11 @@ def main(args):
                 loss = loss + 0.05 * dynamic_loss  # loss +
 
                 # #### Co-visibility loss ####
-                if 'covisibility' in batch:
+                if 'covisibility' in batch and cov_score is not None:
                     covis_gt = batch['covisibility'][0].to(device)  # [S, 1, H, W]
-                    covis_pred = predictions.get('covisibility_score')
-                    if covis_pred is not None:
-                        covis_pred = covis_pred[0]  # [S, H, W]
-                        covis_gt = covis_gt[:, 0]  # [S, H, W]
-                        covis_loss = F.l1_loss(covis_pred, covis_gt)
-                        loss = loss + 0.01 * covis_loss
+                    covis_gt = covis_gt[:, 0]  # [S, H, W]
+                    covis_loss = F.l1_loss(cov_score[0], covis_gt)
+                    loss = loss + 0.01 * covis_loss
 
                 # #### semantic segmenation ####
                 # if 'semantic_mask' in batch:
@@ -330,7 +402,6 @@ def main(args):
                 if step >= 0:
                     lpips_val = lpips_loss_fn(rendered_image, target_image)
                     loss += 0.05 * min(step / 1000, 1.0) * lpips_val.mean() # *
-
             loss.backward()
             optimizer.step()
             scheduler.step()
