@@ -20,33 +20,28 @@ from datasets.dataset import WaymoOpenDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import time
+import math
 def compute_lifespan_loss(gamma):
     return torch.mean(torch.abs(1 / (gamma + 1e-6)))
 def compute_gs_conf_slot_loss(gs_conf_raw, cov_score, K):
     """
     K-slot gs_conf alignment loss using soft co-visibility targets.
-    Uses cov_score (continuous [0,1]) directly to create per-slot
-    soft targets via linear decay, instead of hard binary thresholds.
-    cov ≈ 1.0 → only slot 0 active (target [1, 0, 0, 0])
-    cov ≈ 0.5 → slots 0-1 moderately active (target [1, 0.6, 0.2, 0])
-    cov ≈ 0.0 → all K slots near 1 (target [1, 0.75, 0.5, 0.25])
-    Args:
-        gs_conf_raw: [N, K] raw (pre-filter) gs_conf values
-        cov_score: [N] co-visibility score per pixel
-        K: number of Gaussian slots
-    Returns:
-        scalar loss
+    gs_conf_raw: [N, K] logits
+    cov_score: [N]
     """
     device = gs_conf_raw.device
     N = gs_conf_raw.shape[0]
-    # desired_slots: cov=1→1, cov=0→K
-    desired_slots = 1.0 + (1.0 - cov_score) * (K - 1)  # [N], range [1, K]
+    desired_slots = 1.0 + (1.0 - cov_score) * (K - 1)  # [N]
     k_idx = torch.arange(K, device=device).float().unsqueeze(0)  # [1, K]
-    # Soft target: slot k target = max(0, 1 - k/desired)
-    # Linear decay — slots beyond desired_slots go to 0
     raw_target = 1.0 - k_idx / desired_slots.unsqueeze(1)  # [N, K]
     soft_target = raw_target.clamp(0.0, 1.0)  # [N, K]
-    return F.binary_cross_entropy_with_logits(gs_conf_raw, soft_target)
+
+    # 关闭自动平均
+    bce_all = F.binary_cross_entropy_with_logits(gs_conf_raw, soft_target, reduction="none")
+    # 每个像素内部K个slot损失求和，再像素维度求平均
+    loss_per_pixel = bce_all.sum(dim=1)
+    return loss_per_pixel.mean()
+
 def compute_covis_weighted_l1(rendered, target, cov_score):
     """
     Co-visibility weighted L1 rendering loss.
@@ -79,7 +74,7 @@ def parse_args():
     parser.add_argument('--image_dir', type=str, default="/home/djhuai/zuo/mobicom/dggt_2/dggt/data/nuscenes/processed_10Hz/mini")
     parser.add_argument('--ckpt_path', type=str, default='')
     parser.add_argument('--log_dir', type=str, default='logs/xxx')
-    parser.add_argument('--sequence_length', type=int, default=3)#8,4
+    parser.add_argument('--sequence_length', type=int, default=4)#8,4
     parser.add_argument('--chunk_size', type=int, default=4)
     parser.add_argument('--max_epoch', type=int, default=50000)
     parser.add_argument('--save_image', type=int, default=100)
@@ -130,10 +125,10 @@ def main(args):
     ], weight_decay=1e-4)
     warmup_iterations = 1000
     scheduler = LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min((step + 1) / warmup_iterations, 1.0) * 0.5 * (
-            1 + torch.cos(torch.tensor(torch.pi * step / args.max_epoch)))
-    )
+    optimizer,
+    lr_lambda=lambda step: min((step + 1) / warmup_iterations, 1.0) * 0.5 * (
+        1 + math.cos(math.pi * step / args.max_epoch))
+)
     for step in tqdm(range(args.max_epoch)):
         sampler.set_epoch(step)       
         for batch in dataloader:
@@ -145,7 +140,7 @@ def main(args):
                 dynamic_masks = batch['dynamic_mask'].to(device)[:, :, 0, :, :]
             
             optimizer.zero_grad()
-            with torch.amp.autocast('cuda', dtype=dtype):
+            with torch.cuda.amp.autocast(dtype=dtype):
                 predictions = model(images)
                 H, W = images.shape[-2:]
                 extrinsics, intrinsics = pose_encoding_to_extri_intri(predictions['pose_enc'], (H, W))
@@ -200,14 +195,16 @@ def main(args):
                     active_mask = active_k_mask.reshape(-1)
                     # Physically remove inactive Gaussians
                     # static_points already [N*K, 3] from point_map K dim
-                    static_points = static_points[active_mask]
-                    static_rgbs = static_rgbs[active_mask]
-                    static_opacity = static_opacity[active_mask]
-                    static_scales = static_scales[active_mask]
-                    static_rotations = static_rotations[active_mask]
-                    static_gs_conf = static_gs_conf_raw[active_k_mask]  # [M]
-                    gs_timestamps = timestamps[frame_idx].repeat_interleave(K_gs)[active_mask]
-                    gs_dynamic_list = gs_dynamic_list.repeat_interleave(K_gs)[active_mask]
+                    # .contiguous() prevents CUDA illegal memory access from
+                    # non-contiguous strides after boolean mask indexing.
+                    static_points = static_points[active_mask].contiguous()
+                    static_rgbs = static_rgbs[active_mask].contiguous()
+                    static_opacity = static_opacity[active_mask].contiguous()
+                    static_scales = static_scales[active_mask].contiguous()
+                    static_rotations = static_rotations[active_mask].contiguous()
+                    static_gs_conf = static_gs_conf_raw[active_k_mask].contiguous()  # [M]
+                    gs_timestamps = timestamps[frame_idx].repeat_interleave(K_gs)[active_mask].contiguous()
+                    gs_dynamic_list = gs_dynamic_list.repeat_interleave(K_gs)[active_mask].contiguous()
                 else:
                     static_gs_conf = get_gs_conf_flat(gs_conf, static_mask)
                     if K_gs > 1:
@@ -241,13 +238,15 @@ def main(args):
                         for k in range(K_gs):
                             active_k_mask[n_range, sorted_idx[:, k]] = (k < active_count)
                         active_mask = active_k_mask.reshape(-1)  # [N*K]
-                        # Physically remove inactive Gaussians
-                        dynamic_point = dynamic_point[active_mask]
-                        dynamic_rgb = dynamic_rgb[active_mask]
-                        dynamic_opacity = dynamic_opacity[active_mask]
-                        dynamic_scale = dynamic_scale[active_mask]
-                        dynamic_rotation = dynamic_rotation[active_mask]
-                        gs_dynamic_list_i = gs_dynamic_list_i.repeat_interleave(K_gs)[active_mask]
+                        # Physically remove inactive Gaussians (dynamic)
+                        # .contiguous() prevents non-contiguous strides from
+                        # boolean mask indexing causing CUDA illegal memory access.
+                        dynamic_point = dynamic_point[active_mask].contiguous()
+                        dynamic_rgb = dynamic_rgb[active_mask].contiguous()
+                        dynamic_opacity = dynamic_opacity[active_mask].contiguous()
+                        dynamic_scale = dynamic_scale[active_mask].contiguous()
+                        dynamic_rotation = dynamic_rotation[active_mask].contiguous()
+                        gs_dynamic_list_i = gs_dynamic_list_i.repeat_interleave(K_gs)[active_mask].contiguous()
                         dynamic_opacity = dynamic_opacity * gs_dynamic_list_i
                     else:
                         gs_dynamic_list_i = torch.concatenate([gs_dynamic_list_i] * K_gs)
@@ -323,7 +322,7 @@ def main(args):
                     slot_loss = compute_gs_conf_slot_loss(
                         static_gs_conf_raw_all, cov_score_static, K_gs
                     )
-                    loss += 0.01 * slot_loss
+                    loss += 0.0001 * slot_loss
                 
                 #dynamic mask loss
                 if 'dynamic_mask' in batch:
@@ -347,18 +346,23 @@ def main(args):
                     lpips_val = lpips_loss_fn(rendered_image, target_image)
                     loss += 0.05 * min(step / 1000, 1.0) * lpips_val.mean() # *
             loss.backward()
+            # 新增梯度裁剪，保护所有模型参数
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
+
         if args.local_rank == 0 and step % 1 == 0:
             lr = scheduler.get_last_lr()[0]
             print(
                 f"[{step}/{args.max_epoch}] Total Loss: {loss.item():.4f} | LR: {lr:.6f}\n"
-                f"  render_loss: {render_loss.item():.4f} | sky_mask_loss: {sky_mask_loss.item():.4f}\n"
-                f"  gs_conf_loss: {gs_conf_loss.item():.4f} | slot_loss: {slot_loss.item():.4f}\n"
-                f"  dynamic_loss: {dynamic_loss.item():.4f} | covis_loss: {covis_loss.item():.4f}\n"
-                f"  lpips: {lpips_val.mean().item():.4f}"
+                f"  render_loss: {render_loss.item():.4f}\n"
+                f"  sky_mask_loss: {sky_mask_loss.item():.4f}\n"
+                f"  gs_conf (w0.01): {(0.01 * gs_conf_loss).item():.4f}\n"
+                f"  slot_loss (w0.0001): {(0.0001 * slot_loss).item():.4f}\n"
+                f"  dynamic_loss (w0.05): {(0.05 * dynamic_loss).item():.4f}\n"
+                f"  covis_loss (w0.01): {(0.01 * covis_loss).item():.4f}\n"
+                f"  lpips (w0.05): {(0.05 * min(step / 1000, 1.0) * lpips_val.mean()).item():.4f}"
             )
-
         if args.local_rank == 0 and step % args.save_image == 0:
             random_frame_idx = random.randint(0, rendered_image.shape[0] - 1)
             rendered = rendered_image[random_frame_idx].detach().cpu().clamp(0, 1)
